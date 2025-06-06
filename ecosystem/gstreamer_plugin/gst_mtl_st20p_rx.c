@@ -195,6 +195,53 @@ static void gst_mtl_st20p_rx_class_init(Gst_Mtl_St20p_RxClass* klass) {
                           "v210", G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 }
 
+typedef struct st20_rx_external_data {
+  GstBuffer* buf;
+  GstMapInfo dest_info;
+} st20_rx_external_data_t;
+
+static int st20p_rx_query_ext_frame(void* priv, struct st_ext_frame* ext_frame,
+                                    struct st20_rx_frame_meta* meta) {
+  Gst_Mtl_St20p_Rx* s = (Gst_Mtl_St20p_Rx*)priv;
+
+  st20_rx_external_data_t* ext_data =
+      (st20_rx_external_data_t*)malloc(sizeof(st20_rx_external_data_t));
+  if (!ext_data) {
+    GST_ERROR("Failed to allocate memory for external data");
+    return GST_FLOW_ERROR;
+  }
+
+  ext_data->buf = gst_buffer_new_allocate(NULL, s->frame_size, NULL);
+  if (!ext_data->buf) {
+    GST_ERROR("Failed to allocate buffer");
+    free(ext_data);
+    return GST_FLOW_ERROR;
+  }
+
+  GstVideoMeta* video_meta = gst_buffer_add_video_meta(
+      ext_data->buf, GST_VIDEO_FRAME_FLAG_NONE, s->format, s->width, s->height);
+  if (!video_meta) {
+    GST_ERROR("Failed to add video meta to buffer");
+    gst_buffer_unref(ext_data->buf);
+    free(ext_data);
+    return GST_FLOW_ERROR;
+  }
+
+  gst_buffer_map(ext_data->buf, &ext_data->dest_info, GST_MAP_WRITE);
+
+  /* fill the ext frame */
+  uint8_t planes = st_frame_fmt_planes(s->ops_rx.output_fmt);
+  for (uint8_t i = 0; i < planes; i++) {
+    ext_frame->addr[i] = ext_data->dest_info.data + video_meta->offset[i];
+    ext_frame->linesize[i] = video_meta->stride[i];
+    ext_frame->iova[i] = 0;
+  }
+  ext_frame->size = s->frame_size;
+  ext_frame->opaque = ext_data;
+
+  return 0;
+}
+
 static gboolean gst_mtl_st20p_rx_start(GstBaseSrc* basesrc) {
   struct st20p_rx_ops* ops_rx;
 
@@ -247,6 +294,26 @@ static gboolean gst_mtl_st20p_rx_start(GstBaseSrc* basesrc) {
     GST_ERROR("Failed to parse input format \"%s\"", src->pixel_format);
     ops_rx = NULL;
     return FALSE;
+  }
+
+  switch (ops_rx->output_fmt) {
+    case ST_FRAME_FMT_V210:
+      src->format = GST_VIDEO_FORMAT_v210;
+      break;
+    case ST_FRAME_FMT_YUV422PLANAR10LE:
+      src->format = GST_VIDEO_FORMAT_I422_10LE;
+      break;
+    default:
+      GST_ERROR("Unsupported pixel format");
+      return FALSE;
+  }
+
+  if (ops_rx->transport_fmt != st_frame_fmt_to_transport(ops_rx->output_fmt)) {
+    ops_rx->flags |= ST20P_RX_FLAG_EXT_FRAME;
+    ops_rx->query_ext_frame = st20p_rx_query_ext_frame;
+    ops_rx->priv = src;
+  } else {
+    GST_WARNING("Using memcpy path");
   }
 
   gst_mtl_common_copy_general_to_session_args(&(src->generalArgs), &(src->portArgs));
@@ -372,7 +439,6 @@ static void gst_mtl_st20p_rx_get_property(GObject* object, guint prop_id, GValue
 static gboolean gst_mtl_st20p_rx_negotiate(GstBaseSrc* basesrc) {
   GstVideoInfo* info;
   Gst_Mtl_St20p_Rx* src = GST_MTL_ST20P_RX(basesrc);
-  struct st20p_rx_ops* ops_rx = &src->ops_rx;
   gint ret;
   GstCaps* caps;
 
@@ -393,18 +459,7 @@ static gboolean gst_mtl_st20p_rx_negotiate(GstBaseSrc* basesrc) {
   info->fps_n = src->fps_n;
   info->fps_d = src->fps_d;
 
-  switch (ops_rx->output_fmt) {
-    case ST_FRAME_FMT_V210:
-      info->finfo = gst_video_format_get_info(GST_VIDEO_FORMAT_v210);
-      break;
-    case ST20_FMT_YUV_422_10BIT:
-      info->finfo = gst_video_format_get_info(GST_VIDEO_FORMAT_I422_10LE);
-      break;
-    default:
-      GST_ERROR("Unsupported pixel format");
-      gst_video_info_free(info);
-      return FALSE;
-  }
+  info->finfo = gst_video_format_get_info(src->format);
 
   caps = gst_caps_new_simple(
       "video/x-raw", "format", G_TYPE_STRING,
@@ -433,24 +488,40 @@ static gboolean gst_mtl_st20p_rx_negotiate(GstBaseSrc* basesrc) {
   return TRUE;
 }
 
-static GstFlowReturn gst_mtl_st20p_rx_create(GstBaseSrc* basesrc, guint64 offset,
-                                             guint length, GstBuffer** buffer) {
-  GstBuffer* buf;
-  Gst_Mtl_St20p_Rx* src = GST_MTL_ST20P_RX(basesrc);
+static GstFlowReturn get_external_frame(Gst_Mtl_St20p_Rx* src, GstBuffer** buffer) {
+  struct st_frame* frame;
+  for (int i = 0; i < src->retry_frame; i++) {
+    frame = st20p_rx_get_frame(src->rx_handle);
+    if (frame) {
+      break;
+    }
+  }
+
+  if (!frame) {
+    GST_INFO("Failed to get frame EOS");
+    return GST_FLOW_EOS;
+  }
+
+  st20_rx_external_data_t* ext_data = frame->opaque;
+  *buffer = ext_data->buf;
+  GST_BUFFER_PTS(*buffer) = frame->timestamp;
+
+  gst_buffer_unmap(ext_data->buf, &ext_data->dest_info);
+  st20p_rx_put_frame(src->rx_handle, frame);
+  free(ext_data);
+
+  return GST_FLOW_OK;
+}
+
+static GstFlowReturn get_internal_frame(Gst_Mtl_St20p_Rx* src, GstBuffer** buffer) {
   struct st_frame* frame;
   GstMapInfo dest_info;
-  gint ret;
-  gsize fill_size;
 
-  buf = gst_buffer_new_allocate(NULL, src->frame_size, NULL);
-  if (!buf) {
+  *buffer = gst_buffer_new_allocate(NULL, src->frame_size, NULL);
+  if (!*buffer) {
     GST_ERROR("Failed to allocate buffer");
     return GST_FLOW_ERROR;
   }
-
-  *buffer = buf;
-
-  GST_OBJECT_LOCK(src);
 
   for (int i = 0; i < src->retry_frame; i++) {
     frame = st20p_rx_get_frame(src->rx_handle);
@@ -461,25 +532,41 @@ static GstFlowReturn gst_mtl_st20p_rx_create(GstBaseSrc* basesrc, guint64 offset
 
   if (!frame) {
     GST_INFO("Failed to get frame EOS");
-    GST_OBJECT_UNLOCK(src);
     return GST_FLOW_EOS;
   }
 
-  gst_buffer_map(buf, &dest_info, GST_MAP_WRITE);
+  gst_buffer_map(*buffer, &dest_info, GST_MAP_WRITE);
 
-  fill_size = gst_buffer_fill(buf, 0, frame->addr[0], src->frame_size);
-  GST_BUFFER_PTS(buf) = frame->timestamp;
+  gsize fill_size = gst_buffer_fill(*buffer, 0, frame->addr[0], src->frame_size);
+  GST_BUFFER_PTS(*buffer) = frame->timestamp;
 
-  gst_buffer_unmap(buf, &dest_info);
+  gst_buffer_unmap(*buffer, &dest_info);
 
   if (fill_size != src->frame_size) {
     GST_ERROR("Failed to fill buffer");
-    ret = GST_FLOW_ERROR;
-  } else {
-    ret = GST_FLOW_OK;
+    return GST_FLOW_ERROR;
   }
 
   st20p_rx_put_frame(src->rx_handle, frame);
+
+  return GST_FLOW_OK;
+}
+
+static GstFlowReturn gst_mtl_st20p_rx_create(GstBaseSrc* basesrc, guint64 offset,
+                                             guint length, GstBuffer** buffer) {
+  Gst_Mtl_St20p_Rx* src = GST_MTL_ST20P_RX(basesrc);
+
+  gint ret = GST_FLOW_OK;
+
+  GST_OBJECT_LOCK(src);
+
+  if(src->ops_rx.flags & ST20P_RX_FLAG_EXT_FRAME) {
+    ret = get_external_frame(src, buffer);
+  }
+  else{
+    ret = get_internal_frame(src, buffer);
+  }
+
   GST_OBJECT_UNLOCK(src);
   return ret;
 }

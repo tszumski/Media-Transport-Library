@@ -78,6 +78,7 @@ struct _Gst_Mtl_St20p_Rx {
   gchar pixel_format[MTL_PORT_MAX_LEN];
   guint framebuffer_num;
   guint fps_n, fps_d;
+  GstVideoFormat format;
 
   /* TODO add support for gpu direct */
 #ifdef MTL_GPU_DIRECT_ENABLED
