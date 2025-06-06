@@ -330,6 +330,7 @@ static gboolean gst_mtl_st20p_tx_session_create(Gst_Mtl_St20p_Tx* sink, GstCaps*
   ops_tx.height = info->height;
   ops_tx.transport_fmt = ST20_FMT_YUV_422_10BIT;
   ops_tx.flags |= ST20P_TX_FLAG_BLOCK_GET;
+  ops_tx.flags |= ST20P_TX_FLAG_EXT_FRAME;
 
   if (sink->framebuffer_num) {
     ops_tx.framebuff_cnt = sink->framebuffer_num;
@@ -486,6 +487,12 @@ static GstFlowReturn gst_mtl_st20p_tx_chain(GstPad* pad, GstObject* parent,
     return GST_FLOW_ERROR;
   }
 
+  GstVideoMeta* video_meta = gst_buffer_get_video_meta(buf);
+  if (!video_meta) {
+    g_print("Failed to get video meta from buffer\n");
+    return GST_FLOW_ERROR;
+  }
+
   for (int i = 0; i < buffer_n; i++) {
     gst_buffer_memory = gst_buffer_peek_memory(buf, i);
 
@@ -499,6 +506,14 @@ static GstFlowReturn gst_mtl_st20p_tx_chain(GstPad* pad, GstObject* parent,
       GST_ERROR("Failed to get frame");
       return GST_FLOW_ERROR;
     }
+    
+    struct st_ext_frame ext_frame;
+    for(int i = 0; i < video_meta->n_planes; i++) {
+      ext_frame.addr[i] = map_info.data + video_meta->offset[i];
+      ext_frame.linesize[i] = video_meta->stride[i];
+      ext_frame.iova[i] = 0;
+    }
+    ext_frame.size = buffer_size;
 
     // By default, timestamping is handled by MTL.
     if (sink->use_pts_for_pacing) {
@@ -506,9 +521,8 @@ static GstFlowReturn gst_mtl_st20p_tx_chain(GstPad* pad, GstObject* parent,
       frame->tfmt = ST10_TIMESTAMP_FMT_TAI;
     }
 
-    mtl_memcpy(frame->addr[0], map_info.data, buffer_size);
+    st20p_tx_put_ext_frame(sink->tx_handle, frame, &ext_frame);
     gst_memory_unmap(gst_buffer_memory, &map_info);
-    st20p_tx_put_frame(sink->tx_handle, frame);
   }
 
   gst_buffer_unref(buf);
